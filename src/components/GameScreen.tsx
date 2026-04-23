@@ -1,11 +1,9 @@
 /**
  * GameScreen — the main game canvas + HUD.
  *
- * Orchestrates:
- * - Canvas resize observer (landscape aware)
- * - 60fps rAF render loop
- * - Audio engine for note detection
- * - Wait Mode game state
+ * Key fix: the rAF render loop reads from a `gameStateRef` (mutable ref)
+ * rather than from React state, so it always sees the latest values
+ * without stale closure issues.
  */
 
 import React, { useRef, useEffect, useCallback, useState } from 'react';
@@ -13,7 +11,7 @@ import { renderFrame, KEYBOARD_HEIGHT_RATIO } from '../canvas/renderLoop';
 import { useAudioEngine } from '../hooks/useAudioEngine';
 import { useGameState } from '../hooks/useGameState';
 import { ParsedSong } from '../midi/parseMidi';
-import { CalibrationResult } from '../types';
+import { CalibrationResult, GameState } from '../types';
 
 interface Props {
     song: ParsedSong;
@@ -26,10 +24,24 @@ export const GameScreen: React.FC<Props> = ({ song, calibration: _calibration, o
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const rafRef = useRef<number>(0);
     const pulseRef = useRef(0);
-    const hasStartedRef = useRef(false);
+
+    // ── Ref that the rAF loop reads directly (no stale closure) ───────────────
+    const gameStateRef = useRef<GameState>({
+        notes: [],
+        currentNoteIndex: 0,
+        waitingForNote: false,
+        songTimeSec: 0,
+        lastWallTime: 0,
+        score: 0,
+    });
 
     const audio = useAudioEngine();
     const { gameState, isComplete, startGame, tickFrame } = useGameState();
+
+    // Keep the ref in sync with React state (for the render loop)
+    useEffect(() => {
+        gameStateRef.current = gameState;
+    }, [gameState]);
 
     const [micError, setMicError] = useState<string | null>(null);
     const [started, setStarted] = useState(false);
@@ -39,29 +51,37 @@ export const GameScreen: React.FC<Props> = ({ song, calibration: _calibration, o
         try {
             await audio.startListening();
         } catch {
-            setMicError('Microphone access required for note detection. Please allow mic access.');
+            setMicError('Accès au microphone requis. Veuillez autoriser le micro dans le navigateur.');
             return;
         }
         startGame(song.notes, song.range);
         setStarted(true);
-        hasStartedRef.current = true;
     }, [audio, startGame, song]);
 
-    // ── Canvas resize ──────────────────────────────────────────────────────────
+    // ── Canvas setup: correct DPR handling ────────────────────────────────────
     useEffect(() => {
         const canvas = canvasRef.current;
         if (!canvas) return;
-        const ro = new ResizeObserver(() => {
-            canvas.width = canvas.offsetWidth * window.devicePixelRatio;
-            canvas.height = canvas.offsetHeight * window.devicePixelRatio;
-            const ctx = canvas.getContext('2d');
-            if (ctx) ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
-        });
+
+        function resize() {
+            const dpr = window.devicePixelRatio || 1;
+            const w = canvas!.offsetWidth;
+            const h = canvas!.offsetHeight;
+            // Only resize if dimensions actually changed to avoid thrashing
+            if (canvas!.width !== Math.round(w * dpr) || canvas!.height !== Math.round(h * dpr)) {
+                canvas!.width = Math.round(w * dpr);
+                canvas!.height = Math.round(h * dpr);
+            }
+        }
+
+        const ro = new ResizeObserver(resize);
         ro.observe(canvas);
+        resize(); // initial
         return () => ro.disconnect();
     }, []);
 
     // ── Main rAF loop ──────────────────────────────────────────────────────────
+    // Reads gameStateRef.current (always fresh) instead of gameState (stale closure)
     useEffect(() => {
         if (!started) return;
 
@@ -70,30 +90,30 @@ export const GameScreen: React.FC<Props> = ({ song, calibration: _calibration, o
         const ctx = canvas.getContext('2d');
         if (!ctx) return;
 
-        // Scale for devicePixelRatio
-        const dpr = window.devicePixelRatio || 1;
-
         function loop() {
+            const dpr = window.devicePixelRatio || 1;
+            // Display dimensions in CSS pixels (what the canvas CSS shows)
             const displayW = canvas!.offsetWidth;
             const displayH = canvas!.offsetHeight;
             const keyboardH = displayH * KEYBOARD_HEIGHT_RATIO;
 
             pulseRef.current++;
 
-            // Game tick
+            // Tick game state (mutates the ref via stateRef inside useGameState)
             tickFrame(audio.checkNoteMatch, displayH, keyboardH);
 
-            // Render
-            ctx!.save();
-            renderFrame(ctx!, canvas!, gameState, song.range, pulseRef.current);
-            ctx!.restore();
+            // Clear and reset transform for each frame
+            ctx!.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+            // Render using DISPLAY pixels (renderFrame uses canvas.width/height)
+            // Pass the display size explicitly to avoid DPR confusion
+            renderFrame(ctx!, canvas!, gameStateRef.current, song.range, pulseRef.current, displayW, displayH);
 
             rafRef.current = requestAnimationFrame(loop);
         }
 
         rafRef.current = requestAnimationFrame(loop);
         return () => cancelAnimationFrame(rafRef.current);
-        // We intentionally only re-subscribe when started changes
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [started]);
 
@@ -123,7 +143,7 @@ export const GameScreen: React.FC<Props> = ({ song, calibration: _calibration, o
                 <div className="hud-center">
                     <span className="song-title">{song.title}</span>
                     {gameState.waitingForNote && (
-                        <span className="wait-badge">⏸ WAITING FOR NOTE</span>
+                        <span className="wait-badge">⏸ PLAY THE NOTE</span>
                     )}
                 </div>
                 <div className="hud-right">
@@ -153,11 +173,11 @@ export const GameScreen: React.FC<Props> = ({ song, calibration: _calibration, o
                         <h2>{song.title}</h2>
                         <p>{song.notes.length} notes · {Math.ceil(song.totalDurationSec)}s</p>
                         <p className="start-hint">
-                            🎹 The song will <strong>pause</strong> on each note and wait for you to play it correctly.
+                            🎹 Le morceau va <strong>se mettre en pause</strong> sur chaque note et attendre que tu la joues.
                         </p>
                         {micError && <div className="error-banner">{micError}</div>}
                         <button className="btn btn-primary btn-large" onClick={handleStart}>
-                            ▶ Start
+                            ▶ Démarrer
                         </button>
                     </div>
                 </div>

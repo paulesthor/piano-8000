@@ -1,22 +1,30 @@
 /**
  * useGameState — Wait Mode game logic hook.
  *
- * Manages the timeline of notes, pauses when waiting for the player,
- * and advances only when the correct note is detected.
+ * Timeline:
+ * - Song time advances in real-time
+ * - When the next note "arrives" (songTime >= note.startSec), timeline FREEZES
+ * - User must play the correct note to unfreeze and advance
+ *
+ * Note Y positions:
+ * - y = 0 when the note is LOOK_AHEAD_SEC seconds away (top of screen)
+ * - y = fallH when the note is at the keyboard (songTime === note.startSec)
+ * - speed = fallH / LOOK_AHEAD_SEC  (px/sec)
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import { GameNote, GameState, KeyboardRange, AUDIO_CONSTANTS } from '../types';
+
+const LOOK_AHEAD_SEC = 4; // must match renderLoop.ts
 
 export interface UseGameStateReturn {
     gameState: GameState;
     isComplete: boolean;
     startGame: (notes: GameNote[], range: KeyboardRange) => void;
     resetGame: () => void;
-    /** Called every animation frame with the current audio check function */
     tickFrame: (
         checkNoteMatch: (targetMidi: number) => boolean,
-        canvasHeight: number,
+        displayHeight: number,
         keyboardHeight: number,
     ) => void;
 }
@@ -34,110 +42,102 @@ export function useGameState(): UseGameStateReturn {
     const [gameState, setGameState] = useState<GameState>(INITIAL_STATE);
     const [isComplete, setIsComplete] = useState(false);
 
-    // Mutable ref mirror so tickFrame (rAF cb) always sees the latest state
     const stateRef = useRef<GameState>(INITIAL_STATE);
-    const isRunningRef = useRef(false);
-
-    // Store notes array separately to avoid stale closures in tickFrame
     const notesRef = useRef<GameNote[]>([]);
+    const isRunning = useRef(false);
 
     const startGame = useCallback((notes: GameNote[], _range: KeyboardRange) => {
-        const freshNotes = notes.map(n => ({ ...n, played: false, y: -AUDIO_CONSTANTS.NOTE_BAR_HEIGHT }));
-        notesRef.current = freshNotes;
-        const initial: GameState = {
-            notes: freshNotes,
+        const fresh = notes.map(n => ({ ...n, played: false, y: -AUDIO_CONSTANTS.NOTE_BAR_HEIGHT }));
+        notesRef.current = fresh;
+        const init: GameState = {
+            notes: fresh,
             currentNoteIndex: 0,
             waitingForNote: false,
             songTimeSec: 0,
             lastWallTime: performance.now() / 1000,
             score: 0,
         };
-        stateRef.current = initial;
-        setGameState(initial);
+        stateRef.current = init;
+        setGameState(init);
         setIsComplete(false);
-        isRunningRef.current = true;
+        isRunning.current = true;
     }, []);
 
     const resetGame = useCallback(() => {
-        isRunningRef.current = false;
+        isRunning.current = false;
         stateRef.current = INITIAL_STATE;
         setGameState(INITIAL_STATE);
         setIsComplete(false);
     }, []);
 
-    /**
-     * Called every animation frame by the canvas render loop.
-     * Mutates stateRef for performance, then pushes to React state every N frames.
-     */
     const tickFrame = useCallback((
         checkNoteMatch: (targetMidi: number) => boolean,
-        canvasHeight: number,
+        displayHeight: number,
         keyboardHeight: number,
     ) => {
-        if (!isRunningRef.current) return;
+        if (!isRunning.current) return;
 
         const s = stateRef.current;
         const notes = notesRef.current;
 
         if (s.currentNoteIndex >= notes.length) {
+            isRunning.current = false;
             setIsComplete(true);
-            isRunningRef.current = false;
             return;
         }
 
         const now = performance.now() / 1000;
-        const fallZoneHeight = canvasHeight - keyboardHeight;
-        const speed = AUDIO_CONSTANTS.NOTE_FALL_SPEED_PX_PER_SEC;
+        const fallH = displayHeight - keyboardHeight;
+        const speed = fallH / LOOK_AHEAD_SEC; // px per second
 
-        // The current target note
-        const targetNote = notes[s.currentNoteIndex];
-
+        const target = notes[s.currentNoteIndex];
         let newSongTime = s.songTimeSec;
         let newWaiting = s.waitingForNote;
-        let newNoteIndex = s.currentNoteIndex;
+        let newIdx = s.currentNoteIndex;
         let newScore = s.score;
 
-        // ── When waiting: check for correct note hit ──────────────────────────
         if (s.waitingForNote) {
-            if (checkNoteMatch(targetNote.midi)) {
-                // Correct note detected! Mark as played and advance.
-                notes[s.currentNoteIndex] = { ...targetNote, played: true };
-                newNoteIndex = s.currentNoteIndex + 1;
+            // ── FROZEN: poll for correct note ────────────────────────────────
+            if (checkNoteMatch(target.midi)) {
+                notes[s.currentNoteIndex] = { ...target, played: true };
+                newIdx = s.currentNoteIndex + 1;
                 newWaiting = false;
                 newScore = s.score + 1;
-                // Resume timeline from current song position
-                newSongTime = targetNote.startSec + targetNote.durationSec;
+                newSongTime = target.startSec + 0.05; // small advance past the note start
             }
+            // songTime stays frozen, lastWallTime advances so we don't jump when unfrozen
         } else {
-            // ── Advance song time normally ─────────────────────────────────────
+            // ── RUNNING: advance song time ───────────────────────────────────
             const elapsed = now - s.lastWallTime;
             newSongTime = s.songTimeSec + elapsed;
 
-            // Check if the next note's "start" has arrived
-            if (newSongTime >= targetNote.startSec) {
-                // Stop timeline and wait for player
+            // Has the current target arrived?
+            if (newSongTime >= target.startSec) {
                 newWaiting = true;
-                newSongTime = targetNote.startSec; // freeze at note start
+                newSongTime = target.startSec; // clamp to note start
             }
         }
 
-        // ── Update Y positions for all notes ─────────────────────────────────
-        // A note's y when songTime === its startSec is at the top (y=0).
-        // It falls to y = fallZoneHeight when that time arrives.
+        // ── Compute Y for every visible note ──────────────────────────────────
+        // y = fallH + (note.startSec - songTime) * speed ... but inverted:
+        //   when timeUntil = LOOK_AHEAD_SEC → y = 0   (top of screen)
+        //   when timeUntil = 0             → y = fallH (at keyboard)
         for (const note of notes) {
             if (note.played) {
-                note.y = fallZoneHeight + 100; // off screen below
+                note.y = fallH + 100; // push below keyboard
                 continue;
             }
-            // How many seconds until this note must be at the bottom?
-            const timeUntilBottom = note.startSec - newSongTime;
-            // Convert to pixel offset from bottom of fall zone
-            note.y = fallZoneHeight - (timeUntilBottom <= 0 ? 0 : timeUntilBottom * speed);
+            const timeUntil = note.startSec - newSongTime;
+            if (timeUntil > LOOK_AHEAD_SEC) {
+                note.y = -(AUDIO_CONSTANTS.NOTE_BAR_HEIGHT + 4); // above screen
+            } else {
+                note.y = fallH - timeUntil * speed;
+            }
         }
 
         const next: GameState = {
             notes: [...notes],
-            currentNoteIndex: newNoteIndex,
+            currentNoteIndex: newIdx,
             waitingForNote: newWaiting,
             songTimeSec: newSongTime,
             lastWallTime: now,
@@ -145,7 +145,6 @@ export function useGameState(): UseGameStateReturn {
         };
 
         stateRef.current = next;
-        // Push to React state (triggers re-render for HUD, etc.)
         setGameState(next);
     }, []);
 
